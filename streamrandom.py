@@ -43,11 +43,10 @@ from random import Random, BPF, RECIP_BPF
 from uuid import UUID
 from unicodedata import normalize
 
-from cryptography.hazmat.primitives.ciphers import Cipher
-from cryptography.hazmat.primitives.ciphers.algorithms import AES
-from cryptography.hazmat.primitives.ciphers.modes import CTR
-from cryptography.hazmat.primitives.hashes import Hash, SHA256
-from cryptography.hazmat.backends import default_backend
+import nacl.encoding
+
+from nacl.bindings import crypto_stream_xchacha20 as xchacha20
+from nacl.hash import blake2b
 from cryptography.utils import int_from_bytes, int_to_bytes
 
 from publication import publish
@@ -164,7 +163,7 @@ class CipherStream(object):
 
     _remaining = b""
 
-    def __init__(self, algorithm):
+    def __init__(self, nonce, key):
         """
         Create a keystream from an algorithm, and a function returning a mode
         for that algorithm at a given block.
@@ -172,8 +171,9 @@ class CipherStream(object):
         @param algorithm: a pyca/cryptography block cipher.  block_size minimum
             of 128 recommended, due to the internal usage of CTR.
         """
-        self._algorithm = algorithm
-        self._octets_per_block = self._algorithm.block_size // 8
+        self._nonce = nonce
+        self._key = key
+        self._octets_per_block = 64
         self._null_block = int_to_bytes(0, self._octets_per_block)
         self.seek(0)
 
@@ -188,30 +188,30 @@ class CipherStream(object):
         closest_block, beyond = divmod(goal, self._octets_per_block)
         self._remaining = b""
         self._pos = closest_block * self._octets_per_block
-        self._encryptor = Cipher(
-            self._algorithm,
-            CTR(int_to_bytes(closest_block, self._octets_per_block)),
-            backend=default_backend(),
-        ).encryptor()
         self.read(beyond)
 
     def tell(self):
         return self._pos
 
     def read(self, n):
-        self._pos += n
+        next_pos = self._pos + n
         result = b""
         remaining = self._remaining
         while n:
             if not remaining:
+                counter = self._pos // self._octets_per_block
                 blocks, remainder = divmod(n, self._octets_per_block)
-                remaining += self._encryptor.update(
-                    self._null_block * (blocks + int(bool(remainder)))
+                remaining += xchacha20.crypto_stream_xchacha20_xor_ic(
+                    self._null_block * (blocks + int(bool(remainder))),
+                    self._nonce,
+                    counter,
+                    self._key,
                 )
             more, remaining = remaining[:n], remaining[n:]
             result += more
             n -= len(more)
         self._remaining = remaining
+        self._pos = next_pos
         return result
 
 
@@ -226,9 +226,17 @@ def stream_from_seed(seed, version=1):
         raise NotImplementedError("only one version exists")
     seed = normalize("NFKD", seed)
     seed = seed.encode("utf-8")
-    hasher = Hash(SHA256(), backend=default_backend())
-    hasher.update(seed)
-    return CipherStream(AES(hasher.finalize()[: AES.block_size // 8]))
+    hashed = blake2b(
+        seed,
+        digest_size=(
+            xchacha20.crypto_stream_xchacha20_NONCEBYTES +
+            xchacha20.crypto_stream_xchacha20_KEYBYTES
+        ),
+        encoder=nacl.encoding.RawEncoder,
+    )
+    nonce = hashed[:xchacha20.crypto_stream_xchacha20_NONCEBYTES]
+    key = hashed[xchacha20.crypto_stream_xchacha20_NONCEBYTES:]
+    return CipherStream(nonce, key)
 
 
 publish()
